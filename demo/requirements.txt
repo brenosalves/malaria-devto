@@ -1,0 +1,7 @@
+transformers>=4.50
+accelerate>=1.0
+peft>=0.13
+bitsandbytes>=0.44
+torch
+pillow>=11.1
+gradio>=4.0

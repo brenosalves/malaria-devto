@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -79,7 +80,23 @@ def parse_args() -> argparse.Namespace:
         help="Match training default — visual token budget after pooling.",
     )
     p.add_argument("--force-fp16", action="store_true")
+    p.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.1,
+        help="Generation repetition penalty (1.0 = off). Mitigates degenerate "
+        "near-duplicate boxes on undertrained models / dense images.",
+    )
+    p.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=8,
+        help="Block exact n-gram repetitions during generation (0 = off).",
+    )
     return p.parse_args()
+
+
+BOX_RE = re.compile(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]")
 
 
 def detect_precision(force_fp16: bool) -> torch.dtype:
@@ -116,7 +133,12 @@ def build_messages(image_path: Path) -> list[dict]:
 
 
 def parse_detection_block(text: str) -> dict[str, Any] | None:
-    """Find the first balanced {...} that json-decodes to a dict containing 'boxes'."""
+    """Find the first balanced {...} that json-decodes to a dict containing 'boxes'.
+
+    Falls back to regex-extracting individual [x, y, w, h] arrays if no
+    balanced JSON is found — covers truncated output and degenerate
+    repetition-loop generations that never closed the outer braces.
+    """
     start = text.find("{")
     while start != -1:
         depth = 0
@@ -135,6 +157,11 @@ def parse_detection_block(text: str) -> dict[str, Any] | None:
                         pass
                     break
         start = text.find("{", start + 1)
+
+    matches = BOX_RE.findall(text)
+    if matches:
+        boxes = [[int(a), int(b), int(c), int(d)] for a, b, c, d in matches]
+        return {"boxes": boxes, "count": len(boxes), "_salvaged": True}
     return None
 
 
@@ -226,6 +253,8 @@ def main() -> None:
             **inputs,
             max_new_tokens=args.max_new_tokens,
             do_sample=False,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
         )
     gen_ids = out_ids[0, inputs["input_ids"].shape[1] :]
     gen_text = processor.tokenizer.decode(gen_ids, skip_special_tokens=True)
@@ -239,7 +268,9 @@ def main() -> None:
 
     pred_boxes_norm: list[list[int]] = detection.get("boxes", [])
     pred_count = detection.get("count")
-    print(f"[i] Parsed {len(pred_boxes_norm)} boxes, count={pred_count}")
+    salvaged = detection.get("_salvaged", False)
+    salvage_tag = "  (salvaged from malformed output)" if salvaged else ""
+    print(f"[i] Parsed {len(pred_boxes_norm)} boxes, count={pred_count}{salvage_tag}")
 
     report = extract_report(gen_text)
     if report:
