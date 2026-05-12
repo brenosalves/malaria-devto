@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Data — never commit MP-IDB (1.4GB) or generated artifacts.
+# (JSONLs hold absolute paths; regenerate via src/data/preprocess.py.)
+# Anchored to repo root so it doesn't accidentally match src/data/.
+/data/
+
+# Model weights / adapters — too large for git
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# Editor
+.vscode/
+.idea/
+
+# Claude — internal working notes, not for the public repo
+CLAUDE.md
+.claude/
