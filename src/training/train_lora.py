@@ -71,17 +71,40 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Cap training samples for a smoke test.",
     )
+    p.add_argument(
+        "--max-soft-tokens",
+        type=int,
+        default=140,
+        help="Visual token budget after pooling (Gemma 4 supports 70/140/280/560/1120). "
+        "Lower = less VRAM, less spatial detail.",
+    )
+    p.add_argument(
+        "--image-max-size",
+        type=int,
+        default=768,
+        help="Pre-resize images so the longest edge is <= this value. Caps raw patches "
+        "in the vision tower, which is the OOM hotspot on T4.",
+    )
+    p.add_argument(
+        "--force-fp16",
+        action="store_true",
+        help="Force fp16 + paged_adamw_8bit even if torch reports bf16 support "
+        "(Turing emulates bf16 — fp16 is usually faster on T4).",
+    )
     return p.parse_args()
 
 
-def detect_precision() -> tuple[torch.dtype, bool]:
-    """Return (compute_dtype, use_bf16). T4 has no bf16; fall back to fp16."""
+def detect_precision(force_fp16: bool) -> tuple[torch.dtype, bool]:
+    """Return (compute_dtype, use_bf16). T4 has no native bf16; force_fp16 overrides detection."""
     if not torch.cuda.is_available():
         print("[!] No CUDA — this script needs a GPU. Aborting.", file=sys.stderr)
         sys.exit(1)
+    if force_fp16:
+        print("[i] --force-fp16 set. Using fp16 + paged_adamw_8bit.")
+        return torch.float16, False
     if torch.cuda.is_bf16_supported():
         return torch.bfloat16, True
-    print("[i] GPU lacks bf16 support (likely T4). Using fp16 + paged_adamw_8bit.")
+    print("[i] GPU lacks bf16 support. Using fp16 + paged_adamw_8bit.")
     return torch.float16, False
 
 
@@ -89,7 +112,7 @@ def format_sample(sample: dict) -> dict:
     """Map a JSONL record to the OpenAI-style chat schema TRL expects."""
     return {
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
             {
                 "role": "user",
                 "content": [
@@ -105,8 +128,13 @@ def format_sample(sample: dict) -> dict:
     }
 
 
-def build_collate_fn(processor):
-    """Vision-SFT collator: pack messages into model inputs and mask non-text tokens."""
+def build_collate_fn(processor, image_max_size: int):
+    """Vision-SFT collator: pack messages into model inputs and mask non-text tokens.
+
+    image_max_size caps the longest edge of each image (preserving aspect ratio)
+    before handing it to the processor — this bounds the number of raw patches
+    the vision tower has to position-embed, which is the T4 OOM hotspot.
+    """
     pad_id = processor.tokenizer.pad_token_id
     # Special-token attribute names changed between processor versions; resolve once.
     image_token_ids: list[int] = []
@@ -129,7 +157,11 @@ def build_collate_fn(processor):
                 for c in m["content"]
                 if c.get("type") == "image"
             ]
-            imgs = [Image.open(c["image"]).convert("RGB") for c in image_msgs]
+            imgs = []
+            for c in image_msgs:
+                im = Image.open(c["image"]).convert("RGB")
+                im.thumbnail((image_max_size, image_max_size))
+                imgs.append(im)
             texts.append(text)
             images.append(imgs)
 
@@ -166,7 +198,7 @@ def main() -> None:
     args = parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
-    compute_dtype, use_bf16 = detect_precision()
+    compute_dtype, use_bf16 = detect_precision(args.force_fp16)
     print(f"[i] compute_dtype={compute_dtype}, use_bf16={use_bf16}")
 
     quant = BitsAndBytesConfig(
@@ -179,15 +211,30 @@ def main() -> None:
 
     print(f"[i] Loading processor + model: {args.model_id}")
     processor = AutoProcessor.from_pretrained(args.model_id)
+    # Constrain vision token budget — T4 OOMs at the default if images are large.
+    if hasattr(processor.image_processor, "max_soft_tokens"):
+        processor.image_processor.max_soft_tokens = args.max_soft_tokens
+        print(f"[i] image_processor.max_soft_tokens = {args.max_soft_tokens}")
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_id,
         dtype=compute_dtype,
         device_map="auto",
         quantization_config=quant,
-        attn_implementation="eager",  # T4 has no flash-attn
+        attn_implementation="sdpa",  # lighter than 'eager'; flash-attn unavailable on T4
     )
     model.config.use_cache = False  # required for gradient checkpointing
+    # Skipping peft.prepare_model_for_kbit_training: on T4 it casts all non-quantized
+    # params (layer norms, etc.) to fp32 in one shot — that allocation blows the
+    # 16 GB budget. We do the essential pieces manually below, leaving norms in
+    # fp16. Slight risk of numerical instability; usually fine with QLoRA.
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    model.enable_input_require_grads()
 
+    # NOTE: modules_to_save=["lm_head", "embed_tokens"] omitted intentionally.
+    # On T4 (16 GB) Gemma 4's lm_head alone (~1 GB fp16 weights + grads + opt state)
+    # blows the memory envelope. Trade-off: those layers stay frozen.
     peft_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -195,7 +242,6 @@ def main() -> None:
         bias="none",
         target_modules="all-linear",
         task_type="CAUSAL_LM",
-        modules_to_save=["lm_head", "embed_tokens"],
     )
 
     train_ds, val_ds = load_splits(args.data, args.max_train_samples)
@@ -215,7 +261,7 @@ def main() -> None:
         max_grad_norm=0.3,
         logging_steps=5,
         save_strategy="epoch",
-        eval_strategy="epoch",
+        eval_strategy="no",  # disabled on T4: eval forward needs ~3.6 GB for full logits
         bf16=use_bf16,
         fp16=not use_bf16,
         report_to="tensorboard",
@@ -228,10 +274,10 @@ def main() -> None:
         model=model,
         args=training_args,
         train_dataset=train_ds,
-        eval_dataset=val_ds,
+        eval_dataset=None,  # see eval_strategy note
         peft_config=peft_config,
         processing_class=processor,
-        data_collator=build_collate_fn(processor),
+        data_collator=build_collate_fn(processor, args.image_max_size),
     )
 
     print("[i] Starting training")
